@@ -1,0 +1,14 @@
+[Unit]
+Description=HOTAS Fusion virtual combined joystick
+After=systemd-udevd.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=/home/beta-dev/xperiment/hotas-fusion
+ExecStart=/home/beta-dev/xperiment/hotas-fusion/.venv/bin/python /home/beta-dev/xperiment/hotas-fusion/hotas_fusion.py --wait
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
