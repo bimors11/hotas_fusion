@@ -4,6 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import array
+import fcntl
+from pathlib import Path
 import logging
 import select
 import signal
@@ -37,6 +40,94 @@ class RampState:
     min_value: int
     max_value: int
     last_update: float
+
+
+@dataclass
+class GroundFlightRouter:
+    button_role: str
+    button_code: int
+    minimum: int
+    maximum: int
+    value: int
+    ground: bool = False
+    button_down: bool = False
+    maintained: bool = False
+    requested_ground: bool = False
+    flight_button_code: Optional[int] = None
+    ground_active: bool = False
+    flight_active: bool = False
+
+    def select_position(self, code: int, value: int) -> bool:
+        if value == 2:
+            return False
+        if code == self.button_code:
+            self.ground_active = value == 1
+        elif code == self.flight_button_code:
+            self.flight_active = value == 1
+        if self.ground_active == self.flight_active:
+            # Between positions or conflicting contacts: retain current mode.
+            self.requested_ground = self.ground
+            return False
+        self.requested_ground = self.ground_active
+        changed = self.apply_requested()
+        if self.ground != self.requested_ground:
+            LOGGER.warning("Mode change pending: center roll stick")
+        return changed
+
+    def apply_requested(self) -> bool:
+        if self.maintained and self.ground != self.requested_ground and abs(self.normalized()) <= 0.05:
+            self.ground = self.requested_ground
+            LOGGER.info("Controller mapping: %s", "ground" if self.ground else "flight")
+            return True
+        return False
+
+    def normalized(self) -> float:
+        return max(-1.0, min(1.0, 2 * (self.value - self.minimum) / (self.maximum - self.minimum) - 1))
+
+    def outputs(self) -> Tuple[int, int]:
+        value = round(self.normalized() * 32767)
+        return (0, value) if self.ground else (value, 0)
+
+    def toggle(self, value: int) -> bool:
+        if value == 2:  # Ignore key-repeat events.
+            return False
+        pressed = value == 1
+        if self.maintained:
+            self.requested_ground = pressed
+            changed = self.apply_requested()
+            if self.ground != self.requested_ground:
+                LOGGER.warning("Mode change pending: center roll stick")
+            return changed
+        rising = pressed and not self.button_down
+        self.button_down = pressed
+        if not rising:
+            return False
+        if abs(self.normalized()) > 0.05:
+            LOGGER.warning("Mode unchanged: center roll stick, then press mode button again")
+            return False
+        self.ground = not self.ground
+        LOGGER.info("Controller mapping: %s", "ground" if self.ground else "flight")
+        return True
+
+
+def joystick_button_code(source: SourceDevice, index: int) -> int:
+    """Use the kernel joydev map, matching the tester's zero-based buttons."""
+    device_dir = Path("/sys/class/input") / Path(source.device.path).name / "device"
+    nodes = sorted(device_dir.glob("js*"))
+    if len(nodes) != 1:
+        raise RuntimeError("Cannot resolve joystick button numbering; load joydev (sudo modprobe joydev)")
+    mapping = array.array("H", [0] * 512)
+    with open(Path("/dev/input") / nodes[0].name, "rb", buffering=0) as joystick:
+        fcntl.ioctl(joystick.fileno(), 0x84006A34, mapping, True)  # JSIOCGBTNMAP
+    if not 0 <= index < len(mapping) or mapping[index] not in source_key_caps(source):
+        raise RuntimeError(f"Joystick button index {index} not available")
+    return mapping[index]
+
+
+def write_mode_axes(virtual: UInput, router: GroundFlightRouter) -> None:
+    roll, yaw = router.outputs()
+    virtual.write(ecodes.EV_ABS, ecodes.ABS_X, roll)
+    virtual.write(ecodes.EV_ABS, ecodes.ABS_RX, yaw)
 
 
 def code_name(code_type: int, code: int) -> str:
@@ -209,8 +300,13 @@ def create_virtual_device(
     axis_map: Mapping[Tuple[str, int], int],
     key_map: Mapping[Tuple[str, int], int],
     ramped_axes: Set[int],
+    router: Optional[GroundFlightRouter] = None,
 ) -> UInput:
     abs_caps = build_virtual_abs_caps(sources, axis_map, ramped_axes)
+
+    if router is not None:
+        for code in (ecodes.ABS_X, ecodes.ABS_RX):
+            abs_caps[code] = (0, -32767, 32767, 0, 0, 0)
 
     capabilities = {
         ecodes.EV_KEY: sorted(set(key_map.values())),
@@ -304,6 +400,7 @@ def relay_events(
     ramp_states: Mapping[int, RampState],
     source_ranges: Mapping[Tuple[str, int], Tuple[int, int]],
     axis_ramp_time: float,
+    router: Optional[GroundFlightRouter] = None,
 ) -> None:
     devices = {source.device.fd: source for source in sources}
     running = True
@@ -327,6 +424,19 @@ def relay_events(
 
             should_sync = False
             for event in events:
+                if router is not None and event.type == ecodes.EV_ABS and source.role == "stick" and event.code == ecodes.ABS_X:
+                    router.value = event.value
+                    router.apply_requested()
+                    write_mode_axes(virtual, router)
+                    should_sync = True
+                    continue
+                if router is not None and event.type == ecodes.EV_KEY and source.role == router.button_role and event.code in (router.button_code, router.flight_button_code):
+                    changed = (router.select_position(event.code, event.value)
+                               if router.flight_button_code is not None else router.toggle(event.value))
+                    if changed:
+                        write_mode_axes(virtual, router)
+                        should_sync = True
+                    continue
                 if event.type == ecodes.EV_ABS:
                     dst = axis_map.get((source.role, event.code))
                     if dst is not None:
@@ -390,6 +500,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--stick", metavar="NAME", help="Nama lengkap joystick (default: deteksi HOTAS Warthog)")
     parser.add_argument("--throttle", metavar="NAME", help="Nama lengkap throttle (default: deteksi HOTAS Warthog)")
+    parser.add_argument("--ground-button-index", type=int, help="Latched ground contact, zero-based throttle button index")
+    parser.add_argument("--flight-button-index", type=int, help="Latched flight contact, zero-based throttle button index")
+    parser.add_argument("--mode-button-index", type=int, help="Zero-based joystick tester button index")
+    parser.add_argument("--mode-switch", action="store_true", help="Maintained switch: on=ground, off=flight; changes wait for centered stick")
+    parser.add_argument("--mode-button", metavar="EVDEV_NAME", help="Enable ground/flight toggle, e.g. BTN_PINKIE; use --dry-run to find names")
+    parser.add_argument("--mode-button-device", choices=("stick", "throttle"), default="stick", help="Device containing the mode button (default: stick)")
     parser.add_argument("--no-grab", action="store_true", help="Jangan sembunyikan device asli dari aplikasi lain")
     parser.add_argument("--dry-run", action="store_true", help="Tampilkan device dan mapping tanpa membuat uinput")
     parser.add_argument("--list", action="store_true", help="Tampilkan semua input device lalu keluar")
@@ -423,6 +539,51 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         sources = wait_for_sources(args) if args.wait else open_sources(args)
         axis_map, key_map = build_maps(sources)
+        router = None
+        pair_mode = args.ground_button_index is not None or args.flight_button_index is not None
+        if pair_mode:
+            if args.ground_button_index is None or args.flight_button_index is None:
+                raise RuntimeError("Specify both --ground-button-index and --flight-button-index")
+            if args.mode_button or args.mode_button_index is not None or args.mode_switch:
+                raise RuntimeError("Do not combine latched contact indices with single-button mode options")
+            throttle = next(source for source in sources if source.role == "throttle")
+            ground_code = joystick_button_code(throttle, args.ground_button_index)
+            flight_code = joystick_button_code(throttle, args.flight_button_index)
+            if ground_code == flight_code:
+                raise RuntimeError("Ground and flight contacts must be different buttons")
+            active = throttle.device.active_keys()
+            ground_active, flight_active = ground_code in active, flight_code in active
+            if ground_active == flight_active:
+                raise RuntimeError("Select a valid ground/flight switch position: exactly one contact must be active at startup")
+            stick = next(source for source in sources if source.role == "stick")
+            info = source_abs_caps(stick)[ecodes.ABS_X]
+            if info.max <= info.min:
+                raise RuntimeError("Invalid stick X range")
+            router = GroundFlightRouter("throttle", ground_code, info.min, info.max, info.value,
+                                        ground=ground_active, maintained=True, requested_ground=ground_active,
+                                        flight_button_code=flight_code, ground_active=ground_active, flight_active=flight_active)
+            LOGGER.info("Latched throttle mapping: button %s GROUND, button %s FLIGHT; startup %s",
+                        args.ground_button_index, args.flight_button_index, "GROUND" if router.ground else "FLIGHT")
+        if args.mode_button and args.mode_button_index is not None:
+            raise RuntimeError("Choose --mode-button or --mode-button-index, not both")
+        if args.mode_button or args.mode_button_index is not None:
+            button_source = next(source for source in sources if source.role == args.mode_button_device)
+            button_code = (joystick_button_code(button_source, args.mode_button_index)
+                           if args.mode_button_index is not None else ecodes.ecodes.get(args.mode_button))
+            selector = (args.mode_button_device, button_code)
+            if button_code is None or selector not in key_map:
+                raise RuntimeError("Mode button not found; use --dry-run without --mode-button to list available button names")
+            stick = next(source for source in sources if source.role == "stick")
+            info = source_abs_caps(stick)[ecodes.ABS_X]
+            if info.max <= info.min:
+                raise RuntimeError("Invalid stick X range")
+            router = GroundFlightRouter(args.mode_button_device, button_code, info.min, info.max, info.value)
+            router.maintained = args.mode_switch
+            if router.maintained:
+                router.requested_ground = button_code in button_source.device.active_keys()
+                router.ground = router.requested_ground
+            # Keep output button numbering stable; consume this button in the relay.
+            LOGGER.info("Ground/flight enabled: %s %s; startup %s; roll ABS_X, yaw ABS_RX", args.mode_button_device, code_name(ecodes.EV_KEY, button_code), "GROUND" if router.ground else "FLIGHT")
         print_mapping(sources, axis_map, key_map)
         ramped_axes = set() if args.no_axis7_ramp else set(RAMP_AXIS_CODES)
         abs_caps = build_virtual_abs_caps(sources, axis_map, ramped_axes)
@@ -438,10 +599,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if not args.no_grab:
             grab_sources(sources)
 
-        virtual = create_virtual_device(sources, axis_map, key_map, ramped_axes)
+        virtual = create_virtual_device(sources, axis_map, key_map, ramped_axes, router)
+        if router is not None:
+            virtual.write(ecodes.EV_ABS, ecodes.ABS_X, 0)
+            virtual.write(ecodes.EV_ABS, ecodes.ABS_RX, 0)
+            virtual.syn()
         time.sleep(0.5)
         LOGGER.info("virtual joystick aktif: %s", VIRTUAL_NAME)
-        relay_events(sources, virtual, axis_map, key_map, ramp_states, source_ranges, args.axis7_ramp_time)
+        relay_events(sources, virtual, axis_map, key_map, ramp_states, source_ranges, args.axis7_ramp_time, router)
         return 0
     except KeyboardInterrupt:
         return 0
