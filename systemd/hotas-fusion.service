@@ -5,8 +5,8 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-WorkingDirectory=/home/beta-dev/xperiment/hotas-fusion
-ExecStart=/home/beta-dev/xperiment/hotas-fusion/.venv/bin/python /home/beta-dev/xperiment/hotas-fusion/hotas_fusion.py --wait
+WorkingDirectory=/opt/hotas-fusion
+ExecStart=/opt/hotas-fusion/.venv/bin/python -u /opt/hotas-fusion/hotas_fusion.py --wait
 Restart=always
 RestartSec=2
 

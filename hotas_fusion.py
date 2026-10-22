@@ -54,33 +54,41 @@ def normalize_name(value: str) -> str:
     return " ".join(value.lower().replace("-", " ").split())
 
 
-def find_device(tokens: Sequence[str], explicit_path: Optional[str] = None) -> InputDevice:
-    if explicit_path:
-        return InputDevice(explicit_path)
-
+def find_device(tokens: Sequence[str], device_name: Optional[str] = None) -> InputDevice:
+    """Resolve a device name on every scan; event numbers are never configuration."""
     matches: List[InputDevice] = []
     for path in list_devices():
-        dev = InputDevice(path)
+        try:
+            dev = InputDevice(path)
+        except OSError:
+            # Devices can disappear between enumeration and opening.
+            continue
         name = normalize_name(dev.name)
-        if all(token in name for token in tokens):
+        matches_name = (name == normalize_name(device_name)) if device_name else all(token in name for token in tokens)
+        if matches_name:
             matches.append(dev)
         else:
             dev.close()
 
     if not matches:
-        token_text = ", ".join(tokens)
+        token_text = device_name or ", ".join(tokens)
         raise RuntimeError(f"device dengan token [{token_text}] tidak ditemukan")
     if len(matches) > 1:
         choices = ", ".join(f"{dev.path} ({dev.name})" for dev in matches)
+        for dev in matches:
+            dev.close()
         raise RuntimeError(f"lebih dari satu device cocok: {choices}")
     return matches[0]
 
 
 def open_sources(args: argparse.Namespace) -> List[SourceDevice]:
-    return [
-        SourceDevice("stick", find_device(STICK_TOKENS, args.stick)),
-        SourceDevice("throttle", find_device(THROTTLE_TOKENS, args.throttle)),
-    ]
+    stick = find_device(STICK_TOKENS, args.stick)
+    try:
+        throttle = find_device(THROTTLE_TOKENS, args.throttle)
+    except Exception:
+        stick.close()
+        raise
+    return [SourceDevice("stick", stick), SourceDevice("throttle", throttle)]
 
 
 def wait_for_sources(args: argparse.Namespace) -> List[SourceDevice]:
@@ -380,8 +388,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Gabungkan HOTAS Warthog joystick dan throttle menjadi satu virtual joystick Linux."
     )
-    parser.add_argument("--stick", help="Path event joystick, contoh: /dev/input/event25")
-    parser.add_argument("--throttle", help="Path event throttle, contoh: /dev/input/event26")
+    parser.add_argument("--stick", metavar="NAME", help="Nama lengkap joystick (default: deteksi HOTAS Warthog)")
+    parser.add_argument("--throttle", metavar="NAME", help="Nama lengkap throttle (default: deteksi HOTAS Warthog)")
     parser.add_argument("--no-grab", action="store_true", help="Jangan sembunyikan device asli dari aplikasi lain")
     parser.add_argument("--dry-run", action="store_true", help="Tampilkan device dan mapping tanpa membuat uinput")
     parser.add_argument("--list", action="store_true", help="Tampilkan semua input device lalu keluar")
